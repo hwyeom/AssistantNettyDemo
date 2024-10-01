@@ -1,0 +1,13 @@
+spring:
+  application:
+    name : AssistantDemo
+
+server:
+  host: 127.0.0.1
+  port: 9000
+  netty:
+    port: 10000
+    boss-count: 1
+    worker-count: 2
+    keep-alive: true
+    backlog: 5
