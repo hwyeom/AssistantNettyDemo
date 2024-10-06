@@ -1,15 +1,13 @@
 package com.example.assistantdemo.netty.handler;
 
-import com.example.assistantdemo.netty.dto.RobotImageDto;
+import com.example.assistantdemo.netty.dto.*;
 import com.example.assistantdemo.netty.enums.WebSocketMessageType;
 import com.fasterxml.jackson.core.JsonProcessingException;
 import com.fasterxml.jackson.core.type.TypeReference;
 import com.fasterxml.jackson.databind.ObjectMapper;
-import com.google.gson.Gson;
 import io.netty.buffer.ByteBuf;
 import io.netty.channel.Channel;
 import io.netty.channel.ChannelHandlerContext;
-import io.netty.channel.ChannelId;
 import io.netty.channel.ChannelInboundHandlerAdapter;
 import io.netty.channel.group.ChannelGroup;
 import io.netty.handler.codec.http.websocketx.BinaryWebSocketFrame;
@@ -20,43 +18,48 @@ import io.netty.buffer.Unpooled;
 import lombok.RequiredArgsConstructor;
 import lombok.extern.slf4j.Slf4j;
 
+import java.io.IOException;
 import java.net.InetSocketAddress;
-import java.nio.charset.StandardCharsets;
 import java.util.*;
+import java.util.regex.Matcher;
+import java.util.regex.Pattern;
 import java.util.stream.Collectors;
 
+import static com.example.assistantdemo.netty.enums.WebSocketMessageType.ROBOT_LOG;
+import static com.example.assistantdemo.netty.enums.WebSocketMessageType.ROBOT_THUMBNAIL_LIST;
 import static org.springframework.util.StringUtils.hasText;
 
 @Slf4j
 @RequiredArgsConstructor
 public class RobotMonitorHandler extends ChannelInboundHandlerAdapter {
+    private final ObjectMapper om = new ObjectMapper(); // JSON 파서
+
     private final ChannelGroup robotClients;           // 이미지 전송 클라이언트 그룹
-    private final ChannelGroup webUserClients;              // 웹 클라이언트 그룹
-    private final ChannelGroup watchThumbnailUsers;
-    private final ObjectMapper objectMapper = new ObjectMapper(); // JSON 파서
+    private final ChannelGroup watchThumbnailUsers;     // 썸네일 확인 중인 유저 그룹
+    private final Map<String, List<Channel>> webClientChannelMap; // 로봇 IP 기준 모니터링 중인 유저 그룹
+    private final Map<String, RobotMetaInfoDto> robotMetaMap;     // 로봇 메타 정보를 가지고 있는 맵..
 
-    // 로봇 IP 기준 모니터링 중인 웹 클라이언트 정보
-    private final Map<String, List<ChannelId>> webClientChannelMap;
-
-
+    /**
+     * 웹소캣 연결 후 메시지를 수신 받는 곳
+     */
     @Override
     public void channelRead(ChannelHandlerContext ctx, Object msg) throws Exception {
+        // 메시지가 웹소켓 포맷인 경우만 수행
         if (msg instanceof WebSocketFrame) {
             try {
                 WebSocketFrame frame = (WebSocketFrame) msg;
                 if (frame instanceof TextWebSocketFrame) {
+                    // 텍스트 포맷 메시지 처리
                     String message = ((TextWebSocketFrame) msg).text();
-                    // 클라이언트 ID 처리 및 이벤트 처리
                     handleTextTypeEvent(ctx, message);
                 } else if (frame instanceof BinaryWebSocketFrame) {
+                    // 바이너리 포맷 메시지 처리
                     ByteBuf content = frame.content();
-                    // 이미지 전송 로직
-                    handleImageTypeEvent(ctx, content);
+                    handleBinaryTypeEvent(ctx, content);
                 } else {
                     // 다른 유형의 프레임이 들어오면 처리할 수 있음
                     ctx.fireChannelRead(msg); // 필요한 경우 파이프라인의 다음 핸들러로 전달
                 }
-
             } finally {
                 ((WebSocketFrame) msg).release();
             }
@@ -70,10 +73,27 @@ public class RobotMonitorHandler extends ChannelInboundHandlerAdapter {
 
     @Override
     public void handlerRemoved(ChannelHandlerContext ctx) {
-        log.info("Handler removed. {}" , ctx.channel());
-        robotClients.remove(ctx.channel());
-        webUserClients.remove(ctx.channel());
-        watchThumbnailUsers.remove(ctx.channel());
+        log.info("Handler remove. {}" , ctx.channel());
+        Channel c = ctx.channel();
+        if (robotClients.contains(ctx.channel())) {
+            log.info("로봇 채널 연결 해제 {}" , c);
+            robotMetaMap.remove(c.id().toString());
+            robotClients.remove(c);
+            return;
+        }
+        if (watchThumbnailUsers.contains(ctx.channel())) {
+            log.info("썸네일 웹 접속 유저 채널 연결 해제 {}" , c);
+            watchThumbnailUsers.remove(c);
+            return;
+        }
+        for (Map.Entry<String, List<Channel>> entry : webClientChannelMap.entrySet()) {
+            List<Channel> channels = entry.getValue();
+            if (channels.contains(c)) {
+                log.info("로봇 모니터링 유저 채널 연결 해제 {}" , c);
+                channels.remove(c);
+                return;
+            }
+        }
     }
 
     @Override
@@ -82,142 +102,179 @@ public class RobotMonitorHandler extends ChannelInboundHandlerAdapter {
         ctx.close();
     }
 
-    private void handleTextTypeEvent(ChannelHandlerContext ctx, String message) {
-        Map<String, Object> parsedMessage = null;
-        try {
-            parsedMessage = objectMapper.readValue(message, new TypeReference<>() {});
-        } catch (JsonProcessingException e) {
-            log.error(e.getMessage());
-            ctx.close();
-            return;
-        }
-
+    private void handleTextTypeEvent(ChannelHandlerContext ctx, String message) throws JsonProcessingException {
+        // 수신 받은 메시지를 맵 타입으로 변환 (규칙에 안맞는 메시지는 끊어버리자)
+        Map<String, Object> parsedMessage = om.readValue(message, new TypeReference<>() {});
         WebSocketMessageType type = WebSocketMessageType.valueOf((String) parsedMessage.get("type"));
         switch (type) {
             case ROBOT_REGISTER:
-                log.info("닷넷 클라이언트 채널그룹 추가 ID:{}, {}", ctx.channel().id(), ctx.channel());
+                log.info("로봇 채널그룹 추가 channel:{}, meta: {}", ctx.channel(), message);
+                // 로봇을 채널 그룹에 추가하고 메타정보 저장
                 robotClients.add(ctx.channel());
-                break;
-            case WEB_USER_REGISTER:
-                String robotIp = (String) parsedMessage.get("robotIp");
-                // 새로운 웹 클라이언트가 연결될 때 현재 연결된 닷넷 클라이언트 목록을 전송
-                if (!hasText(robotIp)) {
-                    sendDotnetClientList(ctx);
-                    ctx.close();
-                    return;
-                }
-
-                // 닷넷 클라이언트 ID에 대한 웹 클라이언트 그룹을 추가 또는 가져오기
-                log.info("웹 클라이언트 채널그룹 추가 ID:{}, robotIp {}", ctx.channel().id(), robotIp);
-                webUserClients.add(ctx.channel());
-                webClientChannelMap.computeIfAbsent(robotIp, k -> new ArrayList<>()).add(ctx.channel().id());
-                break;
-            case WEB_USER_THUMBNAIL_REGISTER:
-                watchThumbnailUsers.add(ctx.channel());
+                RobotMetaInfoDto rMeta = om.readValue(message, RobotMetaInfoDto.class);
+                rMeta.setChannelId(ctx.channel().id().toString());
+                robotMetaMap.put(ctx.channel().id().toString(), rMeta);
                 break;
             case ROBOT_MOUSE_POINTER:
-                // 로봇 마우스 위치 정보
+                // 로봇 -> 웹 마우스 위치 정보
                 sendTextDataRobotCursorPoint(ctx, message);
                 break;
+            case ROBOT_LOG: {
+                // 로봇 -> 웹 로그 전송
+                RobotLogFromRobotDto fromRobotDto = om.readValue(message, RobotLogFromRobotDto.class);
+                List<RobotLogEntryDto> logList = extractRobotLogEntryDtoByClientMessage(fromRobotDto.getMessage());
+                RobotLogToWebDto dto = RobotLogToWebDto.builder()
+                        .type(ROBOT_LOG.name())
+                        .meta(fromRobotDto.getMeta())
+                        .logs(logList).build();
+                sendWebRobotLog(ctx, dto);
+                break;
+            }
+            case WEB_USER_REGISTER: {
+                String robotIpAddress = (String) parsedMessage.get("robotIpAddress");
+                // 새로운 웹 클라이언트가 연결될 때 현재 연결된 닷넷 클라이언트 목록을 전송
+                if (!hasText(robotIpAddress)) {
+                    sendRobotClientList(ctx);
+                    ctx.close(); return;
+                }
+
+                // 특정 로봇을 팔로우 하는 웹유저에 추가
+                addWebClientChannelMap(robotIpAddress, ctx.channel());
+                ctx.writeAndFlush(new TextWebSocketFrame(om.writeValueAsString(getRobotMetaMapByRobotIpAddress(robotIpAddress))));
+                break;
+            }
+            case WEB_USER_THUMBNAIL_REGISTER: {
+                // 웹 썸네일 필요한 유저 추가
+                if (!watchThumbnailUsers.contains(ctx.channel())) {
+                    log.info("웹 썸네일 유저 채널그룹 추가 ID:{}", ctx.channel());
+                    watchThumbnailUsers.add(ctx.channel());
+                }
+                break;
+            }
+            case WEB_USER_MOUSE_EVENT:
+                // 웹 -> 마우스 이벤트 전송
+                handleMouseEvent(parsedMessage);
+                break;
         }
+    }
+
+    private RobotMetaInfoDto getRobotMetaMapByRobotIpAddress(String robotIpAddress) {
+        for (Map.Entry<String, RobotMetaInfoDto> entry : robotMetaMap.entrySet()) {
+            if(entry.getValue().getIpAddress().equals(robotIpAddress)) {
+                return entry.getValue();
+            }
+        }
+        return null;
+    }
+
+    // 로봇에서 온 로그를 웹 클라이언트로 전송
+    private void sendWebRobotLog(ChannelHandlerContext ctx, RobotLogToWebDto dto) throws JsonProcessingException {
+        if (robotClients.contains(ctx.channel())) {
+            // 특정 웹 클라이언트에만 이미지 전송
+            sendTextDataRobotConsumer(om.writeValueAsString(dto), dto.getMeta().getIpAddress());
+        }
+    }
+
+    // 로봇으로 부터 로그가 오면 {} 부분만 추출해서 List 객체로 변환
+    private List<RobotLogEntryDto> extractRobotLogEntryDtoByClientMessage(String message) {
+        List<RobotLogEntryDto> robotLogEntries = new ArrayList<>();
+        ObjectMapper objectMapper = new ObjectMapper();
+        Pattern logPattern = Pattern.compile("\\{.*?}");
+        Matcher matcher = logPattern.matcher(message);
+
+        while (matcher.find()) {
+            String jsonString = matcher.group(); // 매칭된 JSON 문자열
+            try {
+                // JSON 문자열을 RobotLogEntryDto로 변환
+                RobotLogEntryDto logEntry = objectMapper.readValue(jsonString, RobotLogEntryDto.class);
+                robotLogEntries.add(logEntry);
+            } catch (IOException e) {
+                log.error(e.getMessage(), e);
+            }
+        }
+        return robotLogEntries;
+    }
+
+    // 특정 로봇을 팔로우하는 유저를 맵에 추가
+    private void addWebClientChannelMap(String channelId, Channel channel) {
+        log.info("로봇 모니터링 유저 채널그룹 추가 ID:{}, robot-channelId {}", channel, channelId);
+        // robotIp에 해당하는 리스트를 가져옵니다. 없으면 new ArrayList<>() 할당
+        List<Channel> channels = webClientChannelMap.computeIfAbsent(channelId, k -> new ArrayList<>());
+        // 리스트에 채널 추가
+        channels.add(channel);
     }
 
     // 웹 클라이언트에 로봇 마우스 위치 전송
     private void sendTextDataRobotCursorPoint(ChannelHandlerContext ctx, String message) {
-        // 닷넷 클라이언트에서 온 이미지를 웹 클라이언트로 전송
+        // 로봇에서 온 이미지를 웹 클라이언트로 전송
         if (robotClients.contains(ctx.channel())) {
             // 특정 웹 클라이언트에만 이미지 전송
-            InetSocketAddress socketAddress = (InetSocketAddress) ctx.channel().remoteAddress();
-            String robotIp = socketAddress.getAddress().getHostAddress();
-
-            sendTextDataRobotConsumer(message, robotIp);
+            RobotMetaInfoDto meta = robotMetaMap.get(ctx.channel().id().toString());
+            if (meta != null) {
+                sendTextDataRobotConsumer(message, meta.getIpAddress());
+            }
         }
     }
 
     // 웹 클라이언트에 이미지 전송
-    private void handleImageTypeEvent(ChannelHandlerContext ctx, ByteBuf content) {
+    private void handleBinaryTypeEvent(ChannelHandlerContext ctx, ByteBuf content) {
         // 닷넷 클라이언트에서 온 이미지를 웹 클라이언트로 전송
         if (robotClients.contains(ctx.channel())) {
             // 특정 웹 클라이언트에만 이미지 전송
-            InetSocketAddress socketAddress = (InetSocketAddress) ctx.channel().remoteAddress();
-            String robotIp = socketAddress.getAddress().getHostAddress();
+            String cId = ctx.channel().id().toString();
+            RobotMetaInfoDto meta = robotMetaMap.get(cId);
 
             // 썸네일 유저들에게 이미지 전송
-            RobotImageDto dto = new RobotImageDto(ctx.channel().id().toString(), robotIp, Unpooled.copiedBuffer(content));
-
-//            watchThumbnailUsers.writeAndFlush(message);
-            watchThumbnailUsers.writeAndFlush(new BinaryWebSocketFrame(Unpooled.copiedBuffer(serializeToByteArray(dto))));
+            RobotImageToWebDto dto = RobotImageToWebDto.builder()
+                    .meta(meta)
+                    .byteBuf(Unpooled.copiedBuffer(content))
+                    .build();
+            watchThumbnailUsers.writeAndFlush(new BinaryWebSocketFrame(Unpooled.copiedBuffer(dto.serializeToByteArray())));
             // 상세 모니터링 유저들에게 이미지 전송
-            sendBinaryDataRobotConsumer(dto, robotIp);
-//            sendBinaryDataRobotConsumer(content, robotIp);
+            sendBinaryImageToDetailMonitorUser(dto, meta.getIpAddress());
         }
     }
 
-    // 직렬화 메소드 (예: JSON, Protobuf 등 사용)
-    private byte[] serializeToByteArray(RobotImageDto dto) {
-        // JSON으로 직렬화
-        String json = new Gson().toJson(dto);
-        return json.getBytes(StandardCharsets.UTF_8);
-    }
-
-    private void sendBinaryDataRobotConsumer(RobotImageDto d, String robotIp) {
-        List<ChannelId> channelUsersByRobotIp = webClientChannelMap.get(robotIp);
+    private void sendBinaryImageToDetailMonitorUser(RobotImageToWebDto d, String robotIp) {
+        // 로봇 IP 기준 채널맵에서 요청한 IP를 팔로우 하고 있는 채널을 추출
+        List<Channel> channelUsersByRobotIp = webClientChannelMap.get(robotIp);
         if (channelUsersByRobotIp != null && !channelUsersByRobotIp.isEmpty()) {
-            for (ChannelId userCID : channelUsersByRobotIp) {
-                Channel c = webUserClients.find(userCID);
+            for (Channel c : channelUsersByRobotIp) {
                 if(c != null){
-//                    c.writeAndFlush(new BinaryWebSocketFrame(Unpooled.copiedBuffer(d)));
-                    c.writeAndFlush(new BinaryWebSocketFrame(Unpooled.copiedBuffer(serializeToByteArray(d))));
+                    c.writeAndFlush(new BinaryWebSocketFrame(Unpooled.copiedBuffer(d.serializeToByteArray())));
                 }
-//                    c.writeAndFlush(new BinaryWebSocketFrame(Unpooled.copiedBuffer(d)));
-//                    c.writeAndFlush(new BinaryWebSocketFrame(buf.retainedDuplicate()));
             }
         }
     }
 
     private void sendTextDataRobotConsumer(String message, String robotIp) {
-        List<ChannelId> channelUsersByRobotIp = webClientChannelMap.get(robotIp);
+        List<Channel> channelUsersByRobotIp = webClientChannelMap.get(robotIp);
         if (channelUsersByRobotIp != null && !channelUsersByRobotIp.isEmpty()) {
-            for (ChannelId userCID : channelUsersByRobotIp) {
-                Channel c = webUserClients.find(userCID);
-                if(c != null)
+            for (Channel c : channelUsersByRobotIp) {
+                if(c != null){
                     c.writeAndFlush(new TextWebSocketFrame(message));
+                }
             }
         }
     }
 
     private void handleMouseEvent(Map<String, Object> data) {
-        // 마우스 이벤트 처리 로직 구현
-        String eventType = (String) data.get("eventType");
-        int x = (int) data.get("x");
-        int y = (int) data.get("y");
+        // 마우스 이벤트
+        data.put("x", ((Number) data.get("x")).intValue()); // int 로 가져오기
+        data.put("y", ((Number) data.get("y")).intValue()); // int 로 가져오기
 
-        log.info("Mouse event: {}, x: {}, y: {}", eventType, x, y);
+        log.info("Mouse event: {}", data);
 
-        Optional<Channel> robotChannel = findChannelByIp(robotClients, (String) data.get("robotIp"));
+        Optional<Channel> robotChannel = findChannelByChannelId(robotClients, (String) data.get("channelId"));
         if (robotChannel.isPresent()) {
             try {
+                String s = om.writeValueAsString(data);
                 log.info("로봇에 마우스 이벤트 전달");
-                String s = objectMapper.writeValueAsString(data);
                 robotChannel.get().writeAndFlush(new TextWebSocketFrame(s));
             } catch (JsonProcessingException e) {
                 log.error(e.getMessage());
             }
         }
-        // 웹 클라이언트가 발생시킨 마우스 이벤트를 특정 닷넷 클라이언트로 전송
-//        String[] parts = eventMessage.split(":");
-//        if (parts.length == 2) {
-//            String targetClientId = parts[0];  // 타겟 클라이언트 ID
-//            String mouseEvent = parts[1];  // 마우스 이벤트 정보
-//
-//            ChannelHandlerContext targetCtx = clientChannelMap.get(targetClientId);
-//            if (targetCtx != null) {
-//                targetCtx.writeAndFlush(new TextWebSocketFrame(mouseEvent)); // 특정 클라이언트에 이벤트 전송
-//                log.info("Mouse event sent to client {}: {}", targetClientId, mouseEvent);
-//            } else {
-//                log.warn("No client found with ID: {}", targetClientId);
-//            }
-//        }
     }
 
     private void handleKeyboardEvent(Map<String, Object> keyboardEvent) {
@@ -229,17 +286,16 @@ public class RobotMonitorHandler extends ChannelInboundHandlerAdapter {
     }
 
 
-    private void sendDotnetClientList(ChannelHandlerContext ctx) {
+    private void sendRobotClientList(ChannelHandlerContext ctx) {
         List<String> connectedClientIds = robotClients.stream()
                 .map(channel -> {
-//                    channel.id().asShortText()
                     InetSocketAddress socketAddress = (InetSocketAddress) ctx.channel().remoteAddress();
                     return socketAddress.getAddress().getHostAddress();
                 })  // 또는 필요에 따라 다른 ID를 사용
                 .collect(Collectors.toList());
 
         try {
-            String jsonClientList = objectMapper.writeValueAsString(connectedClientIds);
+            String jsonClientList = om.writeValueAsString(connectedClientIds);
             ctx.writeAndFlush(new TextWebSocketFrame(jsonClientList)); // 웹 클라이언트에 전송
         } catch (JsonProcessingException e) {
             log.error("Error serializing client list", e);
@@ -247,7 +303,7 @@ public class RobotMonitorHandler extends ChannelInboundHandlerAdapter {
     }
 
     // 채널 그룹에서 IP 주소로 채널 찾기
-    private Optional<Channel> findChannelByIp(ChannelGroup channelGroup, String targetIp) {
+    private Optional<Channel> findChannelByTargetIp(ChannelGroup channelGroup, String targetIp) {
         for (Channel channel : channelGroup) {
             InetSocketAddress socketAddress = (InetSocketAddress) channel.remoteAddress();
             String clientIp = socketAddress.getAddress().getHostAddress();
@@ -259,5 +315,20 @@ public class RobotMonitorHandler extends ChannelInboundHandlerAdapter {
         }
         // IP 주소에 해당하는 채널이 없을 경우 null 반환
         return Optional.empty();
+    }
+
+    private Optional<Channel> findChannelByChannelId(ChannelGroup channelGroup, String channelId) {
+        for (Channel channel : channelGroup) {
+            if (channel.id().toString().equals(channelId)) {
+                return Optional.of(channel);
+            }
+        }
+        // 채널이 없을 경우 null 반환
+        return Optional.empty();
+    }
+
+    private String getChannelRemoteAddress(Channel channel) {
+        InetSocketAddress socketAddress = (InetSocketAddress) channel.remoteAddress();
+        return socketAddress.getAddress().getHostAddress();
     }
 }
