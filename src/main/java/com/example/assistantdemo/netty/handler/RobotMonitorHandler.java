@@ -54,8 +54,7 @@ public class RobotMonitorHandler extends ChannelInboundHandlerAdapter {
                     handleTextTypeEvent(ctx, message);
                 } else if (frame instanceof BinaryWebSocketFrame) {
                     // 바이너리 포맷 메시지 처리
-                    ByteBuf content = frame.content();
-                    handleBinaryTypeEvent(ctx, content);
+                    handleBinaryTypeEvent(ctx, frame.content());
                 } else {
                     // 다른 유형의 프레임이 들어오면 처리할 수 있음
                     ctx.fireChannelRead(msg); // 필요한 경우 파이프라인의 다음 핸들러로 전달
@@ -74,6 +73,18 @@ public class RobotMonitorHandler extends ChannelInboundHandlerAdapter {
     @Override
     public void handlerRemoved(ChannelHandlerContext ctx) {
         log.info("Handler remove. {}" , ctx.channel());
+        clientRemove(ctx);
+    }
+
+    @Override
+    public void exceptionCaught(ChannelHandlerContext ctx, Throwable cause) {
+        log.error("Exception caught message: {}", cause.getMessage());
+        clientRemove(ctx);
+        ctx.close();
+    }
+
+    // 클라이언트 채널 연결 해제
+    private void clientRemove(ChannelHandlerContext ctx) {
         Channel c = ctx.channel();
         if (robotClients.contains(ctx.channel())) {
             log.info("로봇 채널 연결 해제 {}" , c);
@@ -96,12 +107,7 @@ public class RobotMonitorHandler extends ChannelInboundHandlerAdapter {
         }
     }
 
-    @Override
-    public void exceptionCaught(ChannelHandlerContext ctx, Throwable cause) {
-        log.error("Exception caught.", cause);
-        ctx.close();
-    }
-
+    // 텍스트 타입의 메시지가 클라이언트로 부터 오면 처리한다
     private void handleTextTypeEvent(ChannelHandlerContext ctx, String message) throws JsonProcessingException {
         // 수신 받은 메시지를 맵 타입으로 변환 (규칙에 안맞는 메시지는 끊어버리자)
         Map<String, Object> parsedMessage = om.readValue(message, new TypeReference<>() {});
@@ -154,6 +160,9 @@ public class RobotMonitorHandler extends ChannelInboundHandlerAdapter {
             case WEB_USER_MOUSE_EVENT:
                 // 웹 -> 마우스 이벤트 전송
                 handleMouseEvent(parsedMessage);
+                break;
+            case WEB_USER_KEYBOARD_EVENT:
+                handleKeyboardEvent(om.readValue(message, RemoteKeyboardEventArg.class));
                 break;
         }
     }
@@ -247,6 +256,7 @@ public class RobotMonitorHandler extends ChannelInboundHandlerAdapter {
         }
     }
 
+    // 특정 로봇을 모니터링 하는 유저에게 텍스트 데이터 전송
     private void sendTextDataRobotConsumer(String message, String robotIp) {
         List<Channel> channelUsersByRobotIp = webClientChannelMap.get(robotIp);
         if (channelUsersByRobotIp != null && !channelUsersByRobotIp.isEmpty()) {
@@ -277,15 +287,13 @@ public class RobotMonitorHandler extends ChannelInboundHandlerAdapter {
         }
     }
 
-    private void handleKeyboardEvent(Map<String, Object> keyboardEvent) {
+    private void handleKeyboardEvent(RemoteKeyboardEventArg arg) {
         // 키보드 이벤트 처리 로직 구현
-        String eventType = (String) keyboardEvent.get("eventType");
-        String key = (String) keyboardEvent.get("key");
-
-        log.info("Keyboard event: {}, key: {}", eventType, key);
+        log.info("Keyboard event: {}", arg);
     }
 
 
+    // 로봇 리스트를 봐야할 곳에게 현재 등록된 로봇 정보를 전송
     private void sendRobotClientList(ChannelHandlerContext ctx) {
         List<String> connectedClientIds = robotClients.stream()
                 .map(channel -> {
@@ -293,7 +301,6 @@ public class RobotMonitorHandler extends ChannelInboundHandlerAdapter {
                     return socketAddress.getAddress().getHostAddress();
                 })  // 또는 필요에 따라 다른 ID를 사용
                 .collect(Collectors.toList());
-
         try {
             String jsonClientList = om.writeValueAsString(connectedClientIds);
             ctx.writeAndFlush(new TextWebSocketFrame(jsonClientList)); // 웹 클라이언트에 전송

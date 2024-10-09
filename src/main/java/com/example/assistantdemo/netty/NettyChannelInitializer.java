@@ -1,6 +1,7 @@
 package com.example.assistantdemo.netty;
 
 import com.example.assistantdemo.netty.dto.RobotMetaInfoDto;
+import com.example.assistantdemo.netty.handler.RequestFilterHandler;
 import com.example.assistantdemo.netty.handler.RobotMonitorHandler;
 import io.netty.channel.Channel;
 import io.netty.channel.ChannelInitializer;
@@ -31,7 +32,6 @@ public class NettyChannelInitializer extends ChannelInitializer<SocketChannel> {
     private final Map<String, List<Channel>> robotGroups = new HashMap<>();
     private final Map<String, RobotMetaInfoDto> robotMetaMap = new HashMap<>();
 
-
     // 클라이언트 소켓 채널이 생성될 때 호출 됨
     @Override
     protected void initChannel(SocketChannel ch) throws Exception {
@@ -42,8 +42,11 @@ public class NettyChannelInitializer extends ChannelInitializer<SocketChannel> {
         pipeline.addLast(new HttpObjectAggregator(65536));  // HTTP 메시지 조각을 모음
         pipeline.addLast(new ChunkedWriteHandler());    // 파일 및 데이터 스트림 핸들링
 
+        // 요청 URL 등 검증
+        String webSocketPath = "/robot";
+        pipeline.addLast(new RequestFilterHandler(webSocketPath));
         // 여기서 최대 프레임 크기를 설정 (예: 10MB로 설정)
-        pipeline.addLast(new WebSocketServerProtocolHandler("/robot",null, true, 10 * 1024 * 1024));
+        pipeline.addLast(new WebSocketServerProtocolHandler(webSocketPath,null, true, 10 * 1024 * 1024));
         pipeline.addLast(new RobotMonitorHandler(robotClients, webUserClients, robotGroups, robotMetaMap));  // 커스텀 핸들러
     }
 }
