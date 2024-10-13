@@ -1,6 +1,7 @@
 package com.example.assistantdemo.netty;
 
 import com.example.assistantdemo.netty.dto.RobotMetaInfoDto;
+import com.example.assistantdemo.netty.dto.RobotMonitorDto;
 import com.example.assistantdemo.netty.handler.RequestFilterHandler;
 import com.example.assistantdemo.netty.handler.RobotMonitorHandler;
 import io.netty.channel.Channel;
@@ -30,7 +31,7 @@ public class NettyChannelInitializer extends ChannelInitializer<SocketChannel> {
     private final ChannelGroup robotClients = new DefaultChannelGroup(GlobalEventExecutor.INSTANCE);
     private final ChannelGroup webUserClients = new DefaultChannelGroup(GlobalEventExecutor.INSTANCE);
     private final Map<String, List<Channel>> robotGroups = new HashMap<>();
-    private final Map<String, RobotMetaInfoDto> robotMetaMap = new HashMap<>();
+    private final Map<String, RobotMonitorDto> robotMetaMap = new HashMap<>();
 
     // 클라이언트 소켓 채널이 생성될 때 호출 됨
     @Override

@@ -37,7 +37,7 @@ public class RobotMonitorHandler extends ChannelInboundHandlerAdapter {
     private final ChannelGroup robotClients;           // 이미지 전송 클라이언트 그룹
     private final ChannelGroup watchThumbnailUsers;     // 썸네일 확인 중인 유저 그룹
     private final Map<String, List<Channel>> webClientChannelMap; // 로봇 IP 기준 모니터링 중인 유저 그룹
-    private final Map<String, RobotMetaInfoDto> robotMetaMap;     // 로봇 메타 정보를 가지고 있는 맵..
+    private final Map<String, RobotMonitorDto> robotMetaMap;     // 로봇 메타 정보를 가지고 있는 맵..
 
     /**
      * 웹소캣 연결 후 메시지를 수신 받는 곳
@@ -54,6 +54,7 @@ public class RobotMonitorHandler extends ChannelInboundHandlerAdapter {
                     handleTextTypeEvent(ctx, message);
                 } else if (frame instanceof BinaryWebSocketFrame) {
                     // 바이너리 포맷 메시지 처리
+                    // 로봇 이미지 전송을 현재 담당
                     handleBinaryTypeEvent(ctx, frame.content());
                 } else {
                     // 다른 유형의 프레임이 들어오면 처리할 수 있음
@@ -72,38 +73,43 @@ public class RobotMonitorHandler extends ChannelInboundHandlerAdapter {
 
     @Override
     public void handlerRemoved(ChannelHandlerContext ctx) {
-        log.info("Handler remove. {}" , ctx.channel());
         clientRemove(ctx);
     }
 
     @Override
     public void exceptionCaught(ChannelHandlerContext ctx, Throwable cause) {
-        log.error("Exception caught message: {}", cause.getMessage());
+        log.error("Exception caught.. ", cause);
         clientRemove(ctx);
-        ctx.close();
     }
 
     // 클라이언트 채널 연결 해제
     private void clientRemove(ChannelHandlerContext ctx) {
-        Channel c = ctx.channel();
-        if (robotClients.contains(ctx.channel())) {
-            log.info("로봇 채널 연결 해제 {}" , c);
-            robotMetaMap.remove(c.id().toString());
-            robotClients.remove(c);
-            return;
-        }
-        if (watchThumbnailUsers.contains(ctx.channel())) {
-            log.info("썸네일 웹 접속 유저 채널 연결 해제 {}" , c);
-            watchThumbnailUsers.remove(c);
-            return;
-        }
-        for (Map.Entry<String, List<Channel>> entry : webClientChannelMap.entrySet()) {
-            List<Channel> channels = entry.getValue();
-            if (channels.contains(c)) {
-                log.info("로봇 모니터링 유저 채널 연결 해제 {}" , c);
-                channels.remove(c);
+        try {
+            Channel c = ctx.channel();
+            log.info("Handler remove. {}" , c);
+            if (robotClients.contains(ctx.channel())) {
+                log.info("로봇 채널 연결 해제 {}" , c);
+                robotMetaMap.remove(c.id().toString());
+                robotClients.remove(c);
                 return;
             }
+            if (watchThumbnailUsers.contains(ctx.channel())) {
+                log.info("썸네일 웹 접속 유저 채널 연결 해제 {}" , c);
+                watchThumbnailUsers.remove(c);
+                return;
+            }
+            for (Map.Entry<String, List<Channel>> entry : webClientChannelMap.entrySet()) {
+                List<Channel> channels = entry.getValue();
+                if (channels.contains(c)) {
+                    log.info("로봇 모니터링 유저 채널 연결 해제 {}" , c);
+                    channels.remove(c);
+                    return;
+                }
+            }
+            ctx.close();
+        }
+        catch (Exception e) {
+            log.error(e.getMessage());
         }
     }
 
@@ -113,18 +119,20 @@ public class RobotMonitorHandler extends ChannelInboundHandlerAdapter {
         Map<String, Object> parsedMessage = om.readValue(message, new TypeReference<>() {});
         WebSocketMessageType type = WebSocketMessageType.valueOf((String) parsedMessage.get("type"));
         switch (type) {
-            case ROBOT_REGISTER:
+            case ROBOT_REGISTER: {
                 log.info("로봇 채널그룹 추가 channel:{}, meta: {}", ctx.channel(), message);
                 // 로봇을 채널 그룹에 추가하고 메타정보 저장
                 robotClients.add(ctx.channel());
-                RobotMetaInfoDto rMeta = om.readValue(message, RobotMetaInfoDto.class);
-                rMeta.setChannelId(ctx.channel().id().toString());
-                robotMetaMap.put(ctx.channel().id().toString(), rMeta);
+                putRobotMetaMap(ctx, message);
                 break;
-            case ROBOT_MOUSE_POINTER:
-                // 로봇 -> 웹 마우스 위치 정보
-                sendTextDataRobotCursorPoint(ctx, message);
+            }
+            case ROBOT_INFO: {
+                // 로봇 -> 서버 로봇 현재 정보 전송 ==> robotMetaMap 에 로봇 정보 업데이트 해놓기
+                putRobotMetaMap(ctx, message);
+                RobotMonitorDto robotMonitorDto = om.readValue(message, RobotMonitorDto.class);
+                log.debug("ROBOT_INFO Update Robot Map : {}", robotMonitorDto);
                 break;
+            }
             case ROBOT_LOG: {
                 // 로봇 -> 웹 로그 전송
                 RobotLogFromRobotDto fromRobotDto = om.readValue(message, RobotLogFromRobotDto.class);
@@ -146,7 +154,6 @@ public class RobotMonitorHandler extends ChannelInboundHandlerAdapter {
 
                 // 특정 로봇을 팔로우 하는 웹유저에 추가
                 addWebClientChannelMap(robotIpAddress, ctx.channel());
-                ctx.writeAndFlush(new TextWebSocketFrame(om.writeValueAsString(getRobotMetaMapByRobotIpAddress(robotIpAddress))));
                 break;
             }
             case WEB_USER_THUMBNAIL_REGISTER: {
@@ -167,9 +174,31 @@ public class RobotMonitorHandler extends ChannelInboundHandlerAdapter {
         }
     }
 
-    private RobotMetaInfoDto getRobotMetaMapByRobotIpAddress(String robotIpAddress) {
-        for (Map.Entry<String, RobotMetaInfoDto> entry : robotMetaMap.entrySet()) {
-            if(entry.getValue().getIpAddress().equals(robotIpAddress)) {
+    // 로봇한테 넘어온 로봇 정보를 맵에 저장하자
+    private void putRobotMetaMap(ChannelHandlerContext ctx, String message) {
+        try {
+            RobotMonitorDto dto = om.readValue(message, RobotMonitorDto.class);
+            dto.getRobotMeta().setChannelId(ctx.channel().id().toString());
+            robotMetaMap.put(dto.getRobotMeta().getIpAddress(), dto);
+        } catch (JsonProcessingException e) {
+            log.error("om.readValue RobotMonitorDto : {}", e.getMessage());
+        }
+    }
+
+    // IP 기준 로봇 정보 맵에서 로봇 정보 추출
+    private RobotMonitorDto getRobotMetaMapByRobotIpAddress(String robotIpAddress) {
+        for (Map.Entry<String, RobotMonitorDto> entry : robotMetaMap.entrySet()) {
+            if(entry.getValue().getRobotMeta().getIpAddress().equals(robotIpAddress)) {
+                return entry.getValue();
+            }
+        }
+        return null;
+    }
+
+    // 채널 기준 로봇 정보 맵에서 로봇 정보 추출
+    private RobotMonitorDto getRobotMetaMapByChannel(Channel channel) {
+        for (Map.Entry<String, RobotMonitorDto> entry : robotMetaMap.entrySet()) {
+            if(entry.getValue().getRobotMeta().getChannelId().equals(channel.id().toString())) {
                 return entry.getValue();
             }
         }
@@ -180,7 +209,8 @@ public class RobotMonitorHandler extends ChannelInboundHandlerAdapter {
     private void sendWebRobotLog(ChannelHandlerContext ctx, RobotLogToWebDto dto) throws JsonProcessingException {
         if (robotClients.contains(ctx.channel())) {
             // 특정 웹 클라이언트에만 이미지 전송
-            sendTextDataRobotConsumer(om.writeValueAsString(dto), dto.getMeta().getIpAddress());
+            RobotMonitorDto rm = getRobotMetaMapByChannel(ctx.channel());
+            sendTextDataRobotConsumer(om.writeValueAsString(dto), Objects.requireNonNull(rm).getRobotMeta().getIpAddress());
         }
     }
 
@@ -213,34 +243,25 @@ public class RobotMonitorHandler extends ChannelInboundHandlerAdapter {
         channels.add(channel);
     }
 
-    // 웹 클라이언트에 로봇 마우스 위치 전송
-    private void sendTextDataRobotCursorPoint(ChannelHandlerContext ctx, String message) {
-        // 로봇에서 온 이미지를 웹 클라이언트로 전송
-        if (robotClients.contains(ctx.channel())) {
-            // 특정 웹 클라이언트에만 이미지 전송
-            RobotMetaInfoDto meta = robotMetaMap.get(ctx.channel().id().toString());
-            if (meta != null) {
-                sendTextDataRobotConsumer(message, meta.getIpAddress());
-            }
-        }
-    }
-
-    // 웹 클라이언트에 이미지 전송
+    // 로봇 클라이언트에서 온 이미지를 웹 클라이언트로 전송
     private void handleBinaryTypeEvent(ChannelHandlerContext ctx, ByteBuf content) {
         // 닷넷 클라이언트에서 온 이미지를 웹 클라이언트로 전송
         if (robotClients.contains(ctx.channel())) {
-            // 특정 웹 클라이언트에만 이미지 전송
-            String cId = ctx.channel().id().toString();
-            RobotMetaInfoDto meta = robotMetaMap.get(cId);
+            // 로봇 정보 조회
+            RobotMonitorDto robotInfo = getRobotMetaMapByChannel(ctx.channel());
+            assert Objects.requireNonNull(robotInfo).getRobotMeta() != null;
 
-            // 썸네일 유저들에게 이미지 전송
+            // 이미지 정보 + 로봇 정보 생성
             RobotImageToWebDto dto = RobotImageToWebDto.builder()
-                    .meta(meta)
+                    .robotInfo(robotInfo)
                     .byteBuf(Unpooled.copiedBuffer(content))
                     .build();
+            // 썸네일 유저들에게 이미지 전송
             watchThumbnailUsers.writeAndFlush(new BinaryWebSocketFrame(Unpooled.copiedBuffer(dto.serializeToByteArray())));
             // 상세 모니터링 유저들에게 이미지 전송
-            sendBinaryImageToDetailMonitorUser(dto, meta.getIpAddress());
+            sendBinaryImageToDetailMonitorUser(dto, robotInfo.getRobotMeta().getIpAddress());
+        } else {
+            robotClients.add(ctx.channel());
         }
     }
 
@@ -307,21 +328,6 @@ public class RobotMonitorHandler extends ChannelInboundHandlerAdapter {
         } catch (JsonProcessingException e) {
             log.error("Error serializing client list", e);
         }
-    }
-
-    // 채널 그룹에서 IP 주소로 채널 찾기
-    private Optional<Channel> findChannelByTargetIp(ChannelGroup channelGroup, String targetIp) {
-        for (Channel channel : channelGroup) {
-            InetSocketAddress socketAddress = (InetSocketAddress) channel.remoteAddress();
-            String clientIp = socketAddress.getAddress().getHostAddress();
-
-            // IP 주소가 일치하면 해당 채널을 반환
-            if (clientIp.equals(targetIp)) {
-                return Optional.of(channel);
-            }
-        }
-        // IP 주소에 해당하는 채널이 없을 경우 null 반환
-        return Optional.empty();
     }
 
     private Optional<Channel> findChannelByChannelId(ChannelGroup channelGroup, String channelId) {
